@@ -1,9 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
-import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
-import CrowMascot from '@/components/CrowMascot'
-import LandingHeaderNav from '@/components/LandingHeaderNav'
-import { useAccount } from '@/lib/useAccount'
-import type { CrowPose } from '@/components/CrowMascot'
+import { useEffect, useState } from 'react'
+import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import AccountMenu from '@/components/AccountMenu'
+import ThemeToggle from '@/components/ThemeToggle'
+import { presenter } from '@/lib/presenter'
+import AutoImportWatcher from '@/components/AutoImportWatcher'
+import CursorToggle from '@/components/CursorToggle'
+import TopNav from '@/components/TopNav'
+import type { NavAction, NavItem } from '@/components/TopNav'
+import { PageHeader, Tabs } from '@/components/ui'
+import { useDataSource } from '@/lib/useDataSource'
+import { formatTradeDate } from '@/lib/dataSource'
+import { ago, useLive, useNow } from '@/lib/live'
+import { isLiveActive } from '@/lib/liveView'
+import { shortDate } from '@/lib/insight'
 import { api } from '@/lib/api'
 import { useResource } from '@/lib/useResource'
 import type { Resource } from '@/lib/useResource'
@@ -13,6 +22,16 @@ import type { RelativeValueSelection } from '@/lib/relativeValue'
 import { initialCoverageSelection } from '@/lib/coverage'
 import type { CoverageSelection } from '@/lib/coverage'
 import type { Dispatch, SetStateAction } from 'react'
+import '@/styles/data-source.css'
+import '@/styles/market-status.css'
+import '@/styles/practice.css'
+import { useAccount } from '@/lib/useAccount'
+import {
+  clearPractice,
+  demoMoney,
+  refreshPractice,
+  usePractice,
+} from '@/lib/practice'
 
 export interface DashboardContext {
   meta: Resource<MetaResponse>
@@ -21,237 +40,262 @@ export interface DashboardContext {
   coverageSelection: CoverageSelection
   setCoverageSelection: Dispatch<SetStateAction<CoverageSelection>>
 }
-const links = [
-  { path: '/app/alerts', label: 'Alerts', icon: '\u25c9' },
-  { path: '/app/demo', label: 'Guided Demo', icon: '\u25b7' },
-  { path: '/app', label: 'Overview', icon: '◈', end: true },
-  { path: '/app/relative-value', label: 'Relative Value', icon: '⇄' },
-  { path: '/app/term-structure', label: 'Term Structure', icon: '⌁' },
-  { path: '/app/backtest', label: 'Backtest', icon: '↻' },
-  { path: '/app/data-health', label: 'Data Health', icon: '▤' },
-  { path: '/app/methodology', label: 'Methodology', icon: '⊙' },
-  { path: '/app/calendar', label: 'Data Coverage', icon: '▦' },
+
+const COMPARE = ['/app/relative-value', '/app/term-structure']
+const DATA = ['/app/import', '/app/data-health', '/app/calendar']
+
+const PAIRS = [
+  'GOLDTEN-GOLDPETAL',
+  'GOLDTEN-GOLDGUINEA',
+  'GOLDGUINEA-GOLDPETAL',
+  'GOLDM-GOLDTEN',
+  'GOLDM-GOLDGUINEA',
+  'GOLDM-GOLDPETAL',
 ]
+
+const links: NavItem[] = [
+  { to: '/app', label: 'Overview', match: ['/app'] },
+  { to: '/app/relative-value', label: 'Compare', match: COMPARE },
+  { to: '/app/backtest', label: 'Backtest' },
+  { to: '/app/practice', label: 'Practice' },
+  { to: '/app/alerts', label: 'Alerts' },
+  { to: '/app/import', label: 'Data', match: DATA },
+  { to: '/app/research', label: 'Research' },
+]
+
+const learn: NavAction[] = [
+  { to: '/app/methodology', label: 'Methodology' },
+  { to: '/app/demo', label: 'Guided tour' },
+  { label: 'Present demo', action: () => presenter.start() },
+]
+
+/** Search-only destinations (sub-pages and account pages). */
+const searchPages: NavAction[] = [
+  { to: '/app/term-structure', label: 'Across expiries' },
+  { to: '/app/data-health', label: 'Data health' },
+  { to: '/app/calendar', label: 'Coverage calendar' },
+  { to: '/app/profile', label: 'Profile' },
+  { to: '/app/security', label: 'Security' },
+]
+
+const sections = [
+  {
+    match: COMPARE,
+    title: 'Compare',
+    subtitle: 'How gold contracts are priced against each other.',
+    tabs: [
+      { to: '/app/relative-value', label: 'Between products' },
+      { to: '/app/term-structure', label: 'Across expiries' },
+    ],
+  },
+  {
+    match: DATA,
+    title: 'Data',
+    subtitle: 'Load official MCX files and check what is available.',
+    tabs: [
+      { to: '/app/import', label: 'Import' },
+      { to: '/app/data-health', label: 'Data health' },
+      { to: '/app/calendar', label: 'Coverage' },
+    ],
+  },
+]
+
+/** Pages that work without market data and need no "import first" banner. */
+const NO_DATA_OK = [
+  '/app',
+  '/app/import',
+  '/app/profile',
+  '/app/research',
+  '/app/practice',
+  '/app/security',
+  '/app/recover',
+  '/app/methodology',
+  '/app/demo',
+]
+
+/** Demo-money balance; links to the Practice page. Signed-in users only. */
+function WalletChip({ userId }: { userId: number }) {
+  const { summary } = usePractice()
+  useEffect(() => {
+    void refreshPractice()
+    return () => clearPractice()
+  }, [userId])
+  if (!summary) return null
+  const change = summary.return_pct
+  return (
+    <Link
+      to="/app/practice"
+      className="tn-wallet"
+      title="Demo money (no cash value). Open Practice."
+    >
+      {demoMoney(summary.equity)}
+      <small
+        className={`tone-${change > 0 ? 'up' : change < 0 ? 'down' : 'neutral'}`}
+      >
+        {change > 0 ? '+' : change < 0 ? '−' : ''}
+        {Math.abs(change).toFixed(1)}%
+      </small>
+    </Link>
+  )
+}
+
+function Wallet() {
+  const { user } = useAccount()
+  return user ? <WalletChip userId={user.id} /> : null
+}
+
+/** Market status: live session, closed with prices pending settlement, or settled. */
+function MarketStatus({
+  source,
+}: {
+  source: ReturnType<typeof useDataSource>
+}) {
+  const { status, state, account, busy, refresh } = source
+  const { snapshot } = useLive()
+  const now = useNow(5000)
+  const latest = formatTradeDate(status?.latest_trade_date)
+  const live =
+    state !== 'offline' && isLiveActive(snapshot, status?.latest_trade_date)
+  const trading = live && snapshot?.state === 'live'
+  const tone = live ? (trading ? 'live' : 'closed') : state
+  const label =
+    state === 'offline'
+      ? 'Offline'
+      : live && snapshot
+        ? trading
+          ? `Live · ${shortDate(snapshot.trade_date)}`
+          : `MCX closed · ${formatTradeDate(snapshot.trade_date)}`
+        : state === 'empty'
+          ? 'No data'
+          : `Settled to ${latest}`
+  const title = live
+    ? `${label}${trading ? `, updated ${ago(snapshot?.updated_at, now) ?? 'just now'}` : ''}. Settlement data to ${latest ?? '—'}.`
+    : label
+  return (
+    <span className="g-status" data-state={tone} title={title}>
+      <i aria-hidden="true" />
+      <Link to="/app/import" className="g-status-link">
+        {label}
+      </Link>
+      {status?.configured && account.user && (
+        <button
+          type="button"
+          onClick={refresh}
+          disabled={busy || status.refreshing}
+          aria-label="Refresh market data from Upstox"
+        >
+          {busy ? '…' : '↻'}
+        </button>
+      )}
+    </span>
+  )
+}
+
 export function AppLayout() {
-  const account = useAccount()
-  const sidebarRef = useRef<HTMLElement>(null)
   const { pathname } = useLocation()
-  const crowPose: CrowPose = pathname.endsWith('/backtest')
-    ? 'running'
-    : pathname.endsWith('/data-health')
-      ? 'inspecting'
-      : pathname.endsWith('/methodology')
-        ? 'reading'
-        : pathname.endsWith('/relative-value') || pathname === '/app'
-          ? 'gold'
-          : 'walking'
-  const [collapsed, setCollapsed] = useState(false)
-  const [mobileOpen, setMobileOpen] = useState(false)
   const meta = useResource(api.meta)
+  const dataSource = useDataSource()
   const [relativeValue, setRelativeValue] = useState(
     initialRelativeValueSelection,
   )
   const [coverageSelection, setCoverageSelection] = useState(
     initialCoverageSelection,
   )
-  useEffect(() => {
-    const media = window.matchMedia('(max-width: 700px)')
-    const closeOnDesktop = () => {
-      if (!media.matches) setMobileOpen(false)
-    }
-    media.addEventListener('change', closeOnDesktop)
-    return () => media.removeEventListener('change', closeOnDesktop)
-  }, [])
-  useEffect(() => {
-    if (!mobileOpen) return
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    const trapFocus = (event: KeyboardEvent) => {
-      if (event.key !== 'Tab') return
-      const items = Array.from(
-        sidebarRef.current?.querySelectorAll<HTMLElement>(
-          'a[href], button:not([disabled])',
-        ) ?? [],
-      ).filter((item) => item.getClientRects().length > 0)
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (!first || !last) return
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    document.addEventListener('keydown', trapFocus)
-    return () => {
-      document.body.style.overflow = previousOverflow
-      document.removeEventListener('keydown', trapFocus)
-    }
-  }, [mobileOpen])
-  const closeNavigation = () => {
-    setMobileOpen(false)
-    requestAnimationFrame(() =>
-      document.querySelector<HTMLButtonElement>('.mobile-toggle')?.focus(),
-    )
-  }
+  const navigate = useNavigate()
+  const path = pathname.replace(/\/$/, '') || '/app'
+  const section = sections.find((item) => item.match.includes(path))
+  const needsData =
+    !NO_DATA_OK.includes(path) &&
+    (dataSource.state === 'empty' || dataSource.state === 'offline')
+
   return (
-    <div
-      className={`dashboard ${collapsed ? 'sidebar-collapsed' : ''}`}
-      onKeyDown={(event) => {
-        if (event.key === 'Escape' && mobileOpen) closeNavigation()
-      }}
-    >
+    <div className="shell shell-topnav">
       <a className="skip-link" href="#dashboard-content">
         Skip to content
       </a>
-      <aside
-        ref={sidebarRef}
-        className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}
-        aria-label="Dashboard navigation"
-      >
-        <NavLink
-          to="/app"
-          className="brand"
-          onClick={() => setMobileOpen(false)}
-          aria-label="Auraxis Overview"
+      <TopNav
+        links={links}
+        more={learn}
+        pages={searchPages}
+        pairs={PAIRS}
+        onPair={(pair) => {
+          setRelativeValue((previous) => ({ ...previous, pair }))
+          navigate('/app/relative-value')
+        }}
+        right={
+          <>
+            <Wallet />
+            <MarketStatus source={dataSource} />
+            <ThemeToggle />
+            <CursorToggle />
+            <AccountMenu placement="down" />
+          </>
+        }
+      />
+      <div className="shell-main">
+        <main
+          id="dashboard-content"
+          className={`shell-content ${section ? 'in-section' : ''}`}
+          tabIndex={-1}
         >
-          <span className="brand-symbol" aria-hidden="true">
-            A<span>╱</span>
-          </span>
-          <span className="brand-word">
-            AURAXIS<small>GOLD FUTURES RESEARCH</small>
-          </span>
-        </NavLink>
-        <div className="sidebar-label">WORKSPACE</div>
-        <nav id="dashboard-nav">
-          {account.user && (
-            <NavLink
-              to="/app/research"
-              className="nav-link"
-              aria-label="My Research"
-              title={collapsed ? 'My Research' : undefined}
-              onClick={() => setMobileOpen(false)}
-            >
-              <span className="nav-icon" aria-hidden="true">
-                ▣
-              </span>
-              <span className="nav-label">My Research</span>
-            </NavLink>
-          )}
-          {links.map((link) => (
-            <NavLink
-              key={link.path}
-              to={link.path}
-              end={link.end}
-              aria-label={`${link.label}${!['Overview', 'Relative Value', 'Term Structure', 'Backtest', 'Data Health', 'Methodology', 'Data Coverage', 'Guided Demo', 'Alerts'].includes(link.label) ? ' (not implemented yet)' : ''}`}
-              title={collapsed ? link.label : undefined}
-              onClick={() => setMobileOpen(false)}
-              className={({ isActive }) =>
-                `nav-link ${isActive ? 'active' : ''}`
-              }
-            >
-              <span className="nav-icon" aria-hidden="true">
-                {link.icon}
-              </span>
-              <span className="nav-label">{link.label}</span>
-              {![
-                'Overview',
-                'Relative Value',
-                'Term Structure',
-                'Backtest',
-                'Data Health',
-                'Methodology',
-                'Data Coverage',
-                'Guided Demo',
-                'Alerts',
-              ].includes(link.label) && (
-                <span className="nav-pending" aria-label="Not implemented">
-                  Soon
+          <div className="page-enter" key={section ? section.title : path}>
+            {section && (
+              <PageHeader
+                title={section.title}
+                subtitle={section.subtitle}
+                actions={
+                  <Tabs label={`${section.title} views`} items={section.tabs} />
+                }
+              />
+            )}
+            {needsData && (
+              <div className="shell-banner" role="status">
+                <span>
+                  {dataSource.state === 'offline'
+                    ? "Can't reach the data server. Make sure the backend is running."
+                    : 'No market data loaded yet.'}
                 </span>
-              )}
-            </NavLink>
-          ))}
-        </nav>
-        <Link
-          to="/"
-          className="dashboard-home"
-          aria-label="Auraxis landing page"
-        >
-          <span aria-hidden="true">&#8592;</span>
-          <span className="nav-label">Auraxis home</span>
-        </Link>
-        <div className="sidebar-bottom">
-          <span className="prototype-dot" aria-hidden="true" />
-          <span className="nav-label">Research prototype</span>
-        </div>
-        <button
-          className="collapse-button"
-          onClick={() => setCollapsed((v) => !v)}
-          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          aria-expanded={!collapsed}
-        >
-          <span aria-hidden="true">{collapsed ? '→' : '←'}</span>
-          <span className="nav-label">Collapse sidebar</span>
-        </button>
-        <button className="mobile-close" onClick={closeNavigation}>
-          Close navigation
-        </button>
-      </aside>
-      {mobileOpen && (
-        <button
-          className="nav-backdrop"
-          aria-label="Close navigation"
-          onClick={closeNavigation}
-        />
-      )}
-      <div className="workspace" inert={mobileOpen}>
-        <header className="topbar">
-          <button
-            className="mobile-toggle"
-            aria-label={mobileOpen ? 'Close navigation' : 'Open navigation'}
-            aria-expanded={mobileOpen}
-            aria-controls="dashboard-nav"
-            onClick={() => {
-              setMobileOpen((v) => !v)
-              requestAnimationFrame(() =>
-                document
-                  .querySelector<HTMLAnchorElement>('.sidebar nav a')
-                  ?.focus(),
-              )
-            }}
-          >
-            ☰
-          </button>
-          <div className="topbar-identity">
-            <CrowMascot pose={crowPose} />
-            <span className="topbar-title">
-              MCX <span className="muted">/</span> Gold futures
-            </span>
+                {dataSource.state === 'empty' && (
+                  <Link className="ui-button primary" to="/app/import">
+                    Import data
+                  </Link>
+                )}
+              </div>
+            )}
+            <div className="page-enter" key={path}>
+              <Outlet
+                context={
+                  {
+                    meta,
+                    relativeValue,
+                    setRelativeValue,
+                    coverageSelection,
+                    setCoverageSelection,
+                  } satisfies DashboardContext
+                }
+              />
+            </div>
           </div>
-          <LandingHeaderNav />
-        </header>
-        <main id="dashboard-content" tabIndex={-1}>
-          <Outlet
-            context={
-              {
-                meta,
-                relativeValue,
-                setRelativeValue,
-                coverageSelection,
-                setCoverageSelection,
-              } satisfies DashboardContext
-            }
-          />
         </main>
-        {!['/app/profile', '/app/research', '/app/alerts'].includes(
-          pathname,
-        ) && (
-          <footer>
-            Educational and research purposes only. Not investment advice.
-          </footer>
+        {dataSource.notice && (
+          <p
+            className={`data-source-notice ${dataSource.notice.tone}`}
+            role={dataSource.notice.tone === 'error' ? 'alert' : 'status'}
+          >
+            {dataSource.notice.text}
+          </p>
         )}
+        <AutoImportWatcher />
+        <footer className="shell-footer">
+          <span>
+            Auraxis · historical research tool · not investment advice
+          </span>
+          <nav aria-label="Footer">
+            <Link to="/app/methodology">Methodology</Link>
+            <Link to="/app/demo">Take the tour</Link>
+            <Link to="/">Home</Link>
+          </nav>
+        </footer>
       </div>
     </div>
   )

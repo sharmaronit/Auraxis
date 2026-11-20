@@ -68,6 +68,9 @@ export interface PricePoint {
   close_p10_999: number | null
   has_trade: boolean
   quality_reason: string
+  /** Daily traded volume and open interest (grams). */
+  volume_grams?: number | null
+  open_interest_grams?: number | null
 }
 export interface PriceSeries {
   product: string
@@ -588,4 +591,21 @@ export interface BacktestResponse extends TermAnalyticsResponse {
   configuration: BacktestConfiguration & { requested_expiry: ISODate | null }
   aggregation: string
   reports: BacktestReport[]
+}
+
+export interface PairSummary {
+  pair: string
+  expiry: ISODate
+  trade_date: ISODate
+  a_p10: number | null
+  b_p10: number | null
+  spread_abs: number | null
+  spread_pct: number | null
+  z: number | null
+  percentile: number | null
+  history: { trade_date: ISODate; spread_abs: number | null }[]
+}
+export interface SpreadsSummaryResponse extends DataResponse {
+  window: number
+  pairs: PairSummary[]
 }

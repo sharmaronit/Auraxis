@@ -4,11 +4,13 @@ import re
 from contextlib import nullcontext
 from datetime import date as Date
 from math import isfinite
+from pathlib import Path
 from typing import Annotated, Literal
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BeforeValidator
+from sqlalchemy.engine import make_url
 
 from app.analytics.backtest import PAIRS, simulate_pair
 from app.analytics.backtest_report import summarize_simulation
@@ -23,7 +25,7 @@ from app.api.analytics_schemas import (
 from app.api.database import get_connection
 from app.api.foundation import _base, _basis, _read
 from app.api.schemas import json_safe
-from app.core.config import Settings, get_settings
+from app.core.config import BACKEND_DIR, Settings, get_settings
 from app.data.loader import bhav
 
 router = APIRouter(prefix="/api", tags=["analytics"])
@@ -105,21 +107,25 @@ def _dates(value):
     return [] if value is None or pd.isna(value) else [value]
 
 
-def _liquidity(raw, row, pair, volume, oi):
+def _leg_index(raw):
+    """(symbol, expiry, trade date) -> stored row; built once per request."""
+    return {
+        (leg.symbol, leg.expiry_date, leg.trade_date): leg
+        for leg in raw.itertuples(index=False)
+    }
+
+
+def _liquidity(index, row, pair, volume, oi):
     a, b = pair.split("-")
     keys = [(a, row["expiry_a"]), *[(b, d) for d in row["expiry_b_used"]]]
     if not row["expiry_b_used"]:
         return False, "missing_brackets"
     legs = []
     for symbol, expiry in keys:
-        matches = raw.loc[
-            (raw.symbol == symbol)
-            & (raw.expiry_date == expiry)
-            & (raw.trade_date == row["trade_date"])
-        ]
-        if matches.empty:
+        leg = index.get((symbol, expiry, row["trade_date"]))
+        if leg is None:
             return False, "missing_component"
-        legs.append(matches.iloc[0])
+        legs.append(leg)
     if any(not leg.has_trade for leg in legs):
         return False, "no_trade"
     if any(
@@ -171,6 +177,102 @@ def _description(row):
     )
 
 
+_SUMMARY_CACHE: dict[tuple, list] = {}
+# Full /api/spreads responses keyed by database file state + query. Any import
+# or refresh rewrites the SQLite file, which changes the key.
+_SPREADS_CACHE: dict[tuple, dict] = {}
+
+
+def _database_fingerprint(settings):
+    url = make_url(settings.database_url)
+    if not url.database or url.database == ":memory:":
+        return None
+    path = Path(url.database)
+    path = path if path.is_absolute() else BACKEND_DIR / path
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@router.get("/spreads/summary")
+def spreads_summary(
+    window: int = Query(10, ge=2, le=60),
+    history: int = Query(30, ge=2, le=250),
+    connection=Depends(get_connection),
+    settings: Settings = Depends(get_settings),
+):
+    """Latest reading per configured pair, for the dashboard overview.
+
+    Uses the same defaults and expiry rule as the comparison page (earliest
+    expiry at least three calendar days after the latest session), without
+    per-row calculation traces.
+    """
+    raw, available = _read(connection, bhav)
+    result = _base(raw)
+    result.update(window=window, pairs=[])
+    if not available:
+        return result
+    as_of = result["data_as_of"]
+    key = (
+        settings.database_url,
+        as_of,
+        len(raw),
+        round(float(raw.close.fillna(0).sum()), 4) if "close" in raw else 0.0,
+        window,
+        history,
+        tuple(settings.spread_pairs),
+    )
+    if key in _SUMMARY_CACHE:
+        result["pairs"] = _SUMMARY_CACHE[key]
+        return result
+    threshold = as_of + pd.Timedelta(days=3) if as_of is not None else None
+    engine = ConnectionEngine(connection)
+    for pair in settings.spread_pairs:
+        frame = compute_spreads(
+            pair=pair,
+            window=window,
+            min_periods=min(5, window),
+            carry_adjusted=True,
+            use_purity_adjustment=False,
+            min_volume_grams=2000,
+            min_oi_grams=0,
+            settings=settings,
+            engine=engine,
+        )
+        if frame.empty:
+            continue
+        expiries = sorted(frame.expiry_a.unique())
+        later = [e for e in expiries if threshold is not None and e >= threshold]
+        chosen = later[0] if later else expiries[-1]
+        group = frame.loc[frame.expiry_a == chosen].sort_values("trade_date")
+        latest = group.iloc[-1]
+        result["pairs"].append(
+            json_safe(
+                dict(
+                    pair=pair,
+                    expiry=chosen,
+                    trade_date=latest.trade_date,
+                    a_p10=latest.a_p10_999,
+                    b_p10=latest.b_p10_999,
+                    spread_abs=latest.spread_abs,
+                    spread_pct=latest.spread_pct,
+                    z=latest.z,
+                    percentile=latest.percentile,
+                    history=[
+                        dict(trade_date=row.trade_date, spread_abs=row.spread_abs)
+                        for row in group.tail(history).itertuples()
+                    ],
+                )
+            )
+        )
+    if len(_SUMMARY_CACHE) > 16:
+        _SUMMARY_CACHE.clear()
+    _SUMMARY_CACHE[key] = result["pairs"]
+    return result
+
+
 @router.get("/spreads", response_model=SpreadsResponse)
 def spreads_api(
     pair: str,
@@ -206,7 +308,11 @@ def spreads_api(
         min_volume_grams=min_volume_grams,
         min_oi_grams=min_oi_grams,
     )
+    cache_key = (_database_fingerprint(settings), tuple(sorted(config.items())))
+    if cache_key in _SPREADS_CACHE:
+        return _SPREADS_CACHE[cache_key]
     raw, available = _read(connection, bhav)
+    legs = _leg_index(raw)
     options = {key: value for key, value in config.items() if key != "expiry"}
     frame = (
         compute_spreads(
@@ -230,7 +336,7 @@ def spreads_api(
                 source["days_mismatch"] = _dates(source["days_mismatch"])
                 source["source_tradable"] = source.pop("tradable")
                 source["liquidity_ok"], source["liquidity_reason"] = _liquidity(
-                    raw, source, pair, min_volume_grams, min_oi_grams
+                    legs, source, pair, min_volume_grams, min_oi_grams
                 )
                 source.update(
                     executable_pair=not cross,
@@ -270,13 +376,18 @@ def spreads_api(
         "non-tradable/thin-volume diagnostics. Undefined spreads do not count. "
         "Liquidity failures never permit simulated execution."
     )
-    return dict(
+    result = dict(
         **common,
         series=series,
         maturity_definition="expiry_b_used lists actual B expiry "
         "or lower/upper brackets; "
         "days_mismatch lists signed B expiry minus A expiry in the same order.",
     )
+    if cache_key[0] is not None:
+        if len(_SPREADS_CACHE) >= 32:
+            _SPREADS_CACHE.clear()
+        _SPREADS_CACHE[cache_key] = result
+    return result
 
 
 @router.get("/curve", response_model=CurveResponse)

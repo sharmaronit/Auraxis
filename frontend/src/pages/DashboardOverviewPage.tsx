@@ -1,406 +1,751 @@
-import DataContext from '@/components/DataContext'
-import { lazy, Suspense } from 'react'
-import { useOutletContext } from 'react-router-dom'
-
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import {
+  Link,
+  useNavigate,
+  useOutletContext,
+  useSearchParams,
+} from 'react-router-dom'
 import type { DashboardContext } from '@/layouts/AppLayout'
 import { api } from '@/lib/api'
-import { number, currency, formatDate, humanize } from '@/lib/format'
 import { useResource } from '@/lib/useResource'
-import type { Resource } from '@/lib/useResource'
-import type {
-  DataResponse,
-  NormalizationBasis,
-  Reference,
-  SourcedResponse,
-} from '@/lib/types'
+import { useDataSource } from '@/lib/useDataSource'
+import { useAccount } from '@/lib/useAccount'
+import {
+  grams,
+  longDate,
+  pairLabel,
+  shortDate,
+  signedInr,
+  signedPct,
+} from '@/lib/insight'
+import { GapChip, Skeleton, Sparkline } from '@/components/ui'
+import Crow from '@/components/Crow'
+import { CountUp } from '@/components/Motion'
+import { productColor } from '@/lib/chartTheme'
+import { HistoryGate } from '@/components/HistoryGate'
+import { FULL_SESSIONS, MIN_SESSIONS, useBuildingHistory } from '@/lib/history'
+import type { PairSummary, Reference } from '@/lib/types'
+import InsightList from '@/components/InsightList'
+import { overviewInsights } from '@/lib/insights'
+import { ago, istTime, useLive, useNow } from '@/lib/live'
+import type { LiveSnapshot } from '@/lib/live'
+import {
+  isLiveActive,
+  liveMoves,
+  livePairs,
+  liveReferences,
+  withLivePrices,
+} from '@/lib/liveView'
+import { GapTrend, PairCheck, Seg, Switch } from '@/components/OverviewWidgets'
+import type { ChartMetric, ChartRange } from '@/components/ProductChart'
+import '@/styles/overview.css'
+import '@/styles/welcome.css'
+import '@/styles/live.css'
+import '@/styles/dashboard.css'
 
-const ReferencePriceChart = lazy(
-  () => import('@/components/ReferencePriceChart'),
-)
+const ProductChart = lazy(() => import('@/components/ProductChart'))
+const WINDOW = 10
+const PRODUCTS = ['GOLDM', 'GOLDTEN', 'GOLDGUINEA', 'GOLDPETAL']
+const RANGES: ChartRange[] = ['1M', '3M', '6M', '1Y', 'All']
 const loadOverview = (signal: AbortSignal) => api.overview({}, signal)
 const loadPrices = (signal: AbortSignal) => api.prices({}, signal)
-function SourceLabel<T extends DataResponse>({
-  response,
+const rupees = new Intl.NumberFormat('en-IN', {
+  style: 'currency',
+  currency: 'INR',
+  maximumFractionDigits: 0,
+})
+
+async function loadPairs(signal: AbortSignal) {
+  const response = await api.spreadsSummary(signal)
+  return {
+    ...response,
+    data: response.data.pairs.filter(
+      (item) => typeof item.spread_abs === 'number',
+    ),
+  }
+}
+
+const toneOf = (value: number | null | undefined) =>
+  typeof value === 'number' && Number.isFinite(value) && value !== 0
+    ? value > 0
+      ? 'up'
+      : 'down'
+    : 'neutral'
+
+/** "Fri 20 Nov" */
+const weekday = (iso: string | null | undefined) =>
+  iso
+    ? new Date(`${iso}T00:00:00Z`).toLocaleDateString('en-GB', {
+        weekday: 'short',
+        day: 'numeric',
+        month: 'short',
+        timeZone: 'UTC',
+      })
+    : ''
+
+function greeting() {
+  const hour = new Date().getHours()
+  return hour < 12
+    ? 'Good morning'
+    : hour < 17
+      ? 'Good afternoon'
+      : 'Good evening'
+}
+
+/** "● LIVE · updated 12 s ago" — what the numbers on the page are. */
+function SourceBadge({
+  snapshot,
+  live,
+  dataAsOf,
 }: {
-  response?: SourcedResponse<T>
+  snapshot: LiveSnapshot | null
+  live: boolean
+  dataAsOf?: string | null
 }) {
-  if (!response) return null
+  const now = useNow()
+  if (live && snapshot) {
+    const trading = snapshot.state === 'live'
+    const time = istTime(snapshot.updated_at, false)
+    return (
+      <span className={`ov-source ${trading ? 'is-live' : 'is-closed'}`}>
+        <i aria-hidden="true" />
+        <b>{trading ? 'Live' : 'Closed'}</b>
+        <span>
+          {trading
+            ? `${weekday(snapshot.trade_date)} · updated ${ago(snapshot.updated_at, now) ?? 'just now'}`
+            : `${weekday(snapshot.trade_date)}${time ? ` · last trade ${time} IST` : ''} · settlement pending`}
+        </span>
+      </span>
+    )
+  }
+  if (!dataAsOf) return null
   return (
-    <DataContext date={response.data.data_as_of} source={response.source} />
+    <span className="ov-source is-settled">
+      <i aria-hidden="true" />
+      <b>Settled</b>
+      <span>
+        {longDate(dataAsOf)}
+        {snapshot?.state === 'closed' && snapshot.market_open
+          ? ' · waiting for the first trades'
+          : ''}
+      </span>
+    </span>
   )
 }
-function ErrorNotice<T>({
-  resource,
-  label,
+
+/** Product picker: the reference's asset dropdown. */
+function ProductPicker({
+  references,
+  value,
+  onChange,
 }: {
-  resource: Resource<T>
-  label: string
+  references: Reference[]
+  value: string
+  onChange: (product: string) => void
 }) {
-  if (!resource.error) return null
+  const menu = useRef<HTMLDetailsElement>(null)
+  const current = references.find((item) => item.product === value)
+  useEffect(() => {
+    const close = (event: MouseEvent | KeyboardEvent) => {
+      const element = menu.current
+      if (!element?.open) return
+      if (event instanceof KeyboardEvent) {
+        if (event.key === 'Escape') element.open = false
+        return
+      }
+      if (!element.contains(event.target as Node)) element.open = false
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', close)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', close)
+    }
+  }, [])
   return (
-    <div className="error-notice" role="alert">
-      <div>
-        <strong>{label} could not refresh</strong>
-        <p>
-          {resource.error}
-          {resource.response
-            ? ' Previously loaded data remains displayed.'
-            : ''}
+    <details className="pp" ref={menu}>
+      <summary aria-label={`Product: ${value}. Change product`}>
+        <span
+          className="pp-mark"
+          style={{ '--accent': productColor(value) } as React.CSSProperties}
+          aria-hidden="true"
+        >
+          {value.replace(/^GOLD/, '').slice(0, 2) || 'G'}
+        </span>
+        <span className="pp-name">
+          <strong>{value}</strong>
+          <small>
+            {current?.expiry_date
+              ? `Exp ${shortDate(current.expiry_date)}`
+              : 'MCX gold'}
+          </small>
+        </span>
+        <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+          <path
+            d="m2.5 4.5 3.5 3.5 3.5-3.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+          />
+        </svg>
+      </summary>
+      <div className="pp-panel" role="listbox" aria-label="Products">
+        {PRODUCTS.map((product) => {
+          const item = references.find((r) => r.product === product)
+          return (
+            <button
+              key={product}
+              type="button"
+              role="option"
+              aria-selected={product === value}
+              onClick={() => {
+                onChange(product)
+                if (menu.current) menu.current.open = false
+              }}
+            >
+              <i style={{ background: productColor(product) }} />
+              <span>{product}</span>
+              <b>
+                {typeof item?.close_p10_999 === 'number'
+                  ? rupees.format(item.close_p10_999)
+                  : '—'}
+              </b>
+              <small className={`tone-${toneOf(item?.day_change_pct)}`}>
+                {signedPct(item?.day_change_pct)}
+              </small>
+            </button>
+          )
+        })}
+      </div>
+    </details>
+  )
+}
+
+function Onboarding({ offline }: { offline: boolean }) {
+  return (
+    <section className="ov-onboarding ui-card">
+      <div className="ov-onboarding-art">
+        <Crow size={170} mood="thinking" />
+      </div>
+      <div className="ov-onboarding-body">
+        <p className="kicker">
+          {offline ? 'Connection needed' : 'Welcome to Auraxis'}
         </p>
+        <h2>
+          {offline
+            ? 'Start the data server'
+            : 'Load market data to begin your research'}
+        </h2>
+        <p>
+          {offline
+            ? "The dashboard can't reach the backend. Start it on port 8010, then reload this page."
+            : 'Once data is loaded, Auraxis ranks every gold contract pair against its own history and highlights what is unusual.'}
+        </p>
+        {!offline && (
+          <ol className="ov-steps">
+            <li>
+              <span className="ov-step-num">1</span>
+              <div>
+                <strong>Import market data</strong>
+                <p>Daily MCX Bhavcopy CSVs — no broker account needed.</p>
+              </div>
+              <Link className="ui-button primary" to="/app/import">
+                Import data
+              </Link>
+            </li>
+            <li>
+              <span className="ov-step-num">2</span>
+              <div>
+                <strong>Find the biggest gap</strong>
+                <p>Every pair is ranked against its usual level.</p>
+              </div>
+            </li>
+            <li>
+              <span className="ov-step-num">3</span>
+              <div>
+                <strong>Test and save</strong>
+                <p>Backtest an idea with costs, then save it.</p>
+              </div>
+            </li>
+          </ol>
+        )}
       </div>
-      <button className="button" onClick={resource.retry}>
-        Retry {label.toLowerCase()}
-      </button>
-    </div>
+    </section>
   )
 }
-function PriceCard({
-  reference,
-  basis,
-}: {
-  reference: Reference
-  basis: NormalizationBasis
-}) {
-  const change = reference.day_change_pct
-  const direction =
-    change === null || change === 0 ? '' : change > 0 ? 'positive' : 'negative'
-  const comparison = reference.previous_comparison_date
-    ? `Same fixed expiry versus ${formatDate(reference.previous_comparison_date)}. ${humanize(reference.change_quality)}. ${humanize(reference.change_reason)}`
-    : humanize(reference.change_reason)
-  return (
-    <article className="panel product-card">
-      <div className="product-card-top">
-        <h2>{reference.product}</h2>
-        <span className="contract-tag">FUTCOM</span>
-      </div>
-      <p className="reference-expiry">
-        Reference expiry <strong>{formatDate(reference.expiry_date)}</strong>
-      </p>
-      {reference.reference_available ? (
-        <>
-          <p className="product-price">
-            {reference.close_p10_999 === null
-              ? 'Unavailable'
-              : currency.format(reference.close_p10_999)}
-          </p>
-          <p className="price-unit">
-            per {basis.base_grams} g · Quote-size normalized
-          </p>
-          <div className={`day-change ${direction}`} title={comparison}>
-            {change === null ? (
-              <span>Day change unavailable</span>
-            ) : (
-              <span>
-                {change > 0 ? '+' : ''}
-                {number.format(change)}%{' '}
-                <span className="change-absolute">
-                  (
-                  {reference.day_change_abs === null
-                    ? 'unavailable'
-                    : `${reference.day_change_abs > 0 ? '+' : ''}${currency.format(reference.day_change_abs)}`}
-                  )
-                </span>
-              </span>
-            )}
-          </div>
-          <details className="comparison-details">
-            <summary>Comparison details</summary>
-            <p>{comparison}</p>
-          </details>
-          <div className="liquidity">
-            <span>
-              Volume{' '}
-              <strong>
-                {reference.volume_grams === null
-                  ? 'Unavailable'
-                  : `${number.format(reference.volume_grams)} g`}
-              </strong>
-            </span>
-            <span>
-              Open interest{' '}
-              <strong>
-                {reference.open_interest_grams === null
-                  ? 'Unavailable'
-                  : `${number.format(reference.open_interest_grams)} g`}
-              </strong>
-            </span>
-          </div>
-        </>
-      ) : (
-        <div className="reference-unavailable">
-          <strong>Reference unavailable</strong>
-          <p>{humanize(reference.selection_reason)}</p>
-        </div>
-      )}
-    </article>
-  )
-}
+
 export function DashboardOverviewPage() {
-  const { meta } = useOutletContext<DashboardContext>()
+  const { setRelativeValue } = useOutletContext<DashboardContext>()
+  const { sessions, building } = useBuildingHistory()
+  // Earlier sessions each ranking can use: grows to the full window.
+  const span = Math.max(1, Math.min(WINDOW, (sessions ?? WINDOW + 1) - 1))
+  const shortHistory =
+    !building && sessions !== null && sessions < FULL_SESSIONS
+  const navigate = useNavigate()
+  const dataSource = useDataSource()
+  const { user } = useAccount()
   const overview = useResource(loadOverview)
   const prices = useResource(loadPrices)
+  const pairs = useResource(loadPairs)
+  const { snapshot } = useLive()
+  const [params, setParams] = useSearchParams()
+  const [metric, setMetric] = useState<ChartMetric>('price')
+  const [range, setRange] = useState<ChartRange>('6M')
+  const [showVolume, setShowVolume] = useState(true)
+  const [compare, setCompare] = useState(false)
+  const [pairChoice, setPairChoice] = useState<string | null>(null)
+  const [trendSpan, setTrendSpan] = useState<'10' | '30'>('30')
+
   const overviewData = overview.response?.data
-  const pricesData = prices.response?.data
-  const basis = overviewData?.normalization ?? meta.response?.data.normalization
-  const excluded =
-    pricesData?.series.reduce(
-      (total, item) =>
-        total + item.history.filter((point) => !point.has_trade).length,
-      0,
-    ) ?? 0
-  const missing =
-    pricesData?.series.reduce(
-      (total, item) =>
-        total +
-        item.history.filter(
-          (point) => point.has_trade && point.close_p10_999 === null,
-        ).length,
-      0,
-    ) ?? 0
-  const hasChart =
-    pricesData?.series.some((item) =>
-      item.history.some(
-        (point) => point.has_trade && point.close_p10_999 !== null,
-      ),
-    ) ?? false
+  const dataAsOf = overviewData?.data_as_of ?? null
+
+  // Today's live prices lead until that session's settlement is stored.
+  const live = isLiveActive(snapshot, dataAsOf)
+  const settledPairs = pairs.response?.data ?? []
+  const references = live
+    ? liveReferences(snapshot)
+    : (overviewData?.references ?? [])
+  const summaries = live ? livePairs(snapshot, settledPairs) : settledPairs
+  const moves: Record<string, number | null> = live
+    ? liveMoves(snapshot)
+    : Object.fromEntries(
+        settledPairs.map((item) => {
+          const values = item.history
+            .map((point) => point.spread_abs)
+            .filter((value): value is number => typeof value === 'number')
+          return [
+            item.pair,
+            values.length >= 2 ? values.at(-1)! - values.at(-2)! : null,
+          ]
+        }),
+      )
+  const asOf = live ? snapshot.trade_date : dataAsOf
+  const lastTrades: Record<string, string | null> = Object.fromEntries(
+    (live ? snapshot.references : []).map((item) => [
+      item.product,
+      istTime(item.last_trade_at, false),
+    ]),
+  )
+
+  const requested = params.get('product')
+  const product =
+    requested && PRODUCTS.includes(requested) ? requested : 'GOLDTEN'
+  const setProduct = (value: string) =>
+    setParams(
+      (previous) => {
+        const next = new URLSearchParams(previous)
+        next.set('product', value)
+        return next
+      },
+      { replace: true },
+    )
+  const reference = references.find((item) => item.product === product)
+
+  const hasData = references.some((r) => r.reference_available)
+  const hasRanks = summaries.some((r) => typeof r.z === 'number')
+  const ranked = [...summaries].sort((x, y) =>
+    hasRanks
+      ? Math.abs(y.z ?? 0) - Math.abs(x.z ?? 0)
+      : Math.abs(y.spread_abs ?? 0) - Math.abs(x.spread_abs ?? 0),
+  )
+  const selectedPair =
+    summaries.find((row) => row.pair === pairChoice) ?? ranked[0]
+  const insights = overviewInsights({
+    references,
+    pairs: summaries,
+    sessions,
+    span,
+    asOf,
+  })
+  const unusualCount = summaries.filter((r) => Math.abs(r.z ?? 0) >= 2).length
+  const priceData = prices.response?.data
+  const chartData =
+    priceData && live ? withLivePrices(priceData, snapshot) : priceData
+  const volumes = references
+    .map((r) => ({ product: r.product, value: r.volume_grams ?? 0 }))
+    .filter((item) => item.value > 0)
+  const totalVolume = volumes.reduce((sum, item) => sum + item.value, 0)
+  const share =
+    totalVolume && reference?.volume_grams
+      ? (reference.volume_grams / totalVolume) * 100
+      : null
+  const explore = (row: PairSummary) => {
+    setRelativeValue((previous) => ({
+      ...previous,
+      pair: row.pair,
+      preferred: row.expiry,
+    }))
+    navigate('/app/relative-value')
+  }
+
+  const loading = overview.loading && !overviewData && !live
+  const empty =
+    !loading &&
+    !hasData &&
+    (dataSource.state === 'empty' ||
+      dataSource.state === 'offline' ||
+      Boolean(overviewData))
+  const when = live ? 'today' : `on ${shortDate(asOf)}`
+  const first = user?.name?.trim().split(/\s+/)[0]
+
   return (
-    <div className="overview-page">
-      <div className="page-heading">
+    <div className="ov-page db">
+      <header className="db-head">
         <div>
-          <p className="eyebrow">RESEARCH WORKSPACE</p>
+          <p className="kicker">
+            {greeting()}
+            {first ? `, ${first}` : ''}
+          </p>
           <h1>Overview</h1>
         </div>
-      </div>
-      <ErrorNotice resource={meta} label="Metadata" />
-      <details className="calculation-details">
-        <summary>Calculation details</summary>
-        <p>
-          {basis
-            ? `${basis.unit}; quote-size conversion with purity adjustment off. Assumed purity is experimental and unverified.`
-            : 'Calculation basis unavailable.'}
-        </p>
-        <p>
-          {basis &&
-            Object.entries(basis.quote_grams)
-              .map(([symbol, grams]) => `${symbol}: ${grams} g`)
-              .join(' · ')}
-        </p>
-      </details>
-      <section aria-labelledby="reference-heading">
-        <div className="section-heading">
-          <h2 id="reference-heading">Reference contracts</h2>
-          <SourceLabel response={overview.response} />
-        </div>
-        <ErrorNotice resource={overview} label="References" />
-        {overview.loading && !overviewData ? (
-          <div
-            className="panel"
-            aria-label="Loading reference contracts"
-            role="status"
-          >
-            <CrowLoader label="Loading reference contracts…" />
-          </div>
-        ) : overviewData?.references.length ? (
-          <div className="product-grid">
-            {overviewData.references.map((reference) => (
-              <PriceCard
-                key={reference.product}
-                reference={reference}
-                basis={overviewData.normalization}
-              />
-            ))}
-          </div>
-        ) : !overview.loading && !overview.error ? (
-          <div className="panel empty-state">
-            No reference contracts available. {overviewData?.message}
-          </div>
-        ) : null}
-        {overviewData && (
-          <details className="selection-details">
-            <summary>How reference contracts are selected</summary>
-            <p>{overviewData.reference_selection_rule}</p>
-          </details>
-        )}
-      </section>
-      <section className="panel chart-panel" aria-labelledby="chart-heading">
-        <div className="section-heading">
-          <div>
-            <h2 id="chart-heading">Fixed-expiry price histories</h2>
-            <p className="section-description">
-              Each line follows one reference contract, not a continuous series.
-            </p>
-          </div>
-          <SourceLabel response={prices.response} />
-        </div>
-        <ErrorNotice resource={prices} label="Price histories" />
-        {prices.loading && !pricesData ? (
-          <div
-            className="skeleton chart-skeleton"
-            role="status"
-            aria-label="Loading price histories"
-          />
-        ) : hasChart && pricesData ? (
-          <>
-            <Suspense
-              fallback={
-                <div
-                  className="skeleton chart-skeleton"
-                  role="status"
-                  aria-label="Loading chart"
-                />
+        <div className="db-head-meta">
+          <SourceBadge snapshot={snapshot} live={live} dataAsOf={dataAsOf} />
+          {hasData && hasRanks && !building && (
+            <button
+              type="button"
+              className={`db-flag ${unusualCount ? 'is-alert' : ''}`}
+              onClick={() =>
+                document
+                  .getElementById('ov-hero')
+                  ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
               }
             >
-              <ReferencePriceChart response={pricesData} />
-            </Suspense>
-            <p className="chart-caption">
-              {pricesData.normalization.unit}
-              {pricesData.purity_adjustment &&
-                ' · Experimental purity adjustment'}
-            </p>
-            {(excluded > 0 || missing > 0) && (
-              <p className="quality-notice">
-                {excluded > 0 &&
-                  `${excluded} untraded observations excluded from the traded line. `}
-                {missing > 0 &&
-                  `${missing} traded observations have missing prices.`}
-              </p>
-            )}
-            <details className="history-details">
-              <summary>Chart details and price table</summary>
-              <p>
-                Each line follows one fixed-expiry contract. Missing and
-                untraded observations break the traded line.
-              </p>
-              <div className="table-scroll">
-                <table>
-                  <caption>
-                    Returned fixed-expiry observations, including untraded and
-                    missing values
-                  </caption>
-                  <thead>
-                    <tr>
-                      <th scope="col">Date</th>
-                      <th scope="col">Product</th>
-                      <th scope="col">Expiry</th>
-                      <th scope="col">Normalized close</th>
-                      <th scope="col">Trade / quality</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pricesData.series.flatMap((series) =>
-                      series.history.map((point) => (
-                        <tr
-                          key={`${series.product}-${point.expiry_date}-${point.trade_date}`}
-                        >
-                          <td>{point.trade_date}</td>
-                          <td>{series.product}</td>
-                          <td>{point.expiry_date}</td>
-                          <td>
-                            {point.close_p10_999 === null
-                              ? 'Unavailable'
-                              : currency.format(point.close_p10_999)}
-                          </td>
-                          <td>
-                            {point.has_trade ? 'Traded' : 'No trade'}
-                            {point.quality_reason &&
-                              ` · ${humanize(point.quality_reason)}`}
-                          </td>
-                        </tr>
-                      )),
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          </>
-        ) : !prices.loading && !prices.error ? (
-          <div className="empty-state">
-            No traded fixed-expiry history available. {pricesData?.message}
-            {pricesData?.series.map((s) => (
-              <p key={s.product}>
-                {s.product}: {humanize(s.selection_reason)}
-              </p>
+              {unusualCount
+                ? `${unusualCount} unusual ${unusualCount === 1 ? 'gap' : 'gaps'} ${when}`
+                : `Gaps look normal ${when}`}
+            </button>
+          )}
+        </div>
+      </header>
+
+      {overview.error && !overviewData && dataSource.state !== 'offline' && (
+        <div className="error-notice" role="alert">
+          <span>{overview.error}</span>
+          <button className="button" onClick={overview.retry}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="ui-stack">
+          <Skeleton height={76} />
+          <Skeleton height={420} />
+          <div className="ui-grid-4">
+            {[0, 1, 2].map((i) => (
+              <Skeleton key={i} height={260} />
             ))}
           </div>
-        ) : null}
-      </section>
-      <section
-        className="panel expiries-panel"
-        aria-labelledby="expiry-heading"
-      >
-        <div className="section-heading">
-          <div>
-            <h2 id="expiry-heading">Upcoming expiries</h2>
-          </div>
-          <SourceLabel response={overview.response} />
         </div>
-        {overview.loading && !overviewData ? (
-          <div
-            className="skeleton"
-            role="status"
-            aria-label="Loading expiries"
-          />
-        ) : overviewData?.upcoming_expiries.length ? (
-          <>
-            <p className="mobile-scroll-hint">
-              Scroll horizontally for liquidity details; vertically for all
-              expiries.
-            </p>
-            <div
-              className="expiry-scroll"
-              tabIndex={0}
-              aria-label="Upcoming expiry list"
+      ) : empty ? (
+        <Onboarding offline={dataSource.state === 'offline'} />
+      ) : (
+        <div className="db-grid">
+          {building && sessions !== null && (
+            <HistoryGate
+              compact
+              sessions={sessions}
+              need={MIN_SESSIONS}
+              title={`${sessions} real trading ${sessions === 1 ? 'day' : 'days'} loaded`}
             >
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Product</th>
-                    <th scope="col">Expiry</th>
-                    <th scope="col">Days left</th>
-                    <th scope="col">Volume</th>
-                    <th scope="col">Liquidity quality</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {overviewData.upcoming_expiries.map((item) => (
-                    <tr key={`${item.product}-${item.expiry_date}`}>
-                      <td className="table-product">{item.product}</td>
-                      <td>{formatDate(item.expiry_date)}</td>
-                      <td>
-                        {item.days_to_expiry}
-                        <span className="muted"> d</span>
-                      </td>
-                      <td>
-                        {item.volume_grams === null
-                          ? 'Unavailable'
-                          : `${number.format(item.volume_grams)} g`}
-                      </td>
-                      <td>
-                        <span
-                          className={`quality-pill ${item.quality_reason ? 'caution' : ''}`}
+              Prices, volumes and the futures curve are ready now. Gap rankings
+              unlock at {MIN_SESSIONS} sessions and are most reliable from{' '}
+              {FULL_SESSIONS}.
+            </HistoryGate>
+          )}
+          {shortHistory && sessions !== null && (
+            <HistoryGate
+              compact
+              sessions={sessions}
+              need={FULL_SESSIONS}
+              title="Gap rankings are live — on a short history"
+            >
+              Each gap is compared with its previous {span} sessions. Rankings
+              settle once {FULL_SESSIONS} trading days are loaded; the backtest
+              needs about 20.
+            </HistoryGate>
+          )}
+
+          {/* Asset row: picker + stats strip */}
+          <section className="db-asset ov-products" aria-label="Product">
+            <ProductPicker
+              references={references}
+              value={product}
+              onChange={setProduct}
+            />
+            <dl className="db-stats ui-card">
+              <div>
+                <dt>Price / 10 g</dt>
+                <dd className="db-stat-strong">
+                  {typeof reference?.close_p10_999 === 'number' ? (
+                    <CountUp
+                      value={reference.close_p10_999}
+                      format={(v) => rupees.format(v)}
+                    />
+                  ) : (
+                    '—'
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>
+                  {reference?.previous_comparison_date
+                    ? `Change since ${shortDate(reference.previous_comparison_date)}${live ? ' close' : ''}`
+                    : 'Change'}
+                </dt>
+                <dd className={`tone-${toneOf(reference?.day_change_pct)}`}>
+                  {signedPct(reference?.day_change_pct)}{' '}
+                  <small>({signedInr(reference?.day_change_abs)})</small>
+                </dd>
+              </div>
+              <div>
+                <dt>Volume {live ? 'today' : ''}</dt>
+                <dd>{grams(reference?.volume_grams)}</dd>
+              </div>
+              <div>
+                <dt>Open interest</dt>
+                <dd>{grams(reference?.open_interest_grams)}</dd>
+              </div>
+              <div>
+                <dt>Volume share</dt>
+                <dd className="db-share">
+                  {share === null ? '—' : `${share.toFixed(0)}%`}
+                  <span aria-hidden="true">
+                    <i
+                      style={{
+                        width: `${Math.max(share ?? 0, 2)}%`,
+                        background: productColor(product),
+                      }}
+                    />
+                  </span>
+                </dd>
+              </div>
+              <div>
+                <dt>Expiry</dt>
+                <dd>
+                  {reference?.expiry_date
+                    ? `${shortDate(reference.expiry_date)} · ${reference.days_to_expiry ?? '—'}d`
+                    : '—'}
+                </dd>
+              </div>
+              <div>
+                <dt>{live ? 'Last trade' : 'Session'}</dt>
+                <dd>
+                  {live
+                    ? reference?.has_trade && lastTrades[product]
+                      ? `${lastTrades[product]} IST`
+                      : 'None today'
+                    : shortDate(asOf)}
+                </dd>
+              </div>
+            </dl>
+          </section>
+
+          {/* Main chart + pair check */}
+          <div className="db-main">
+            <section
+              className="ui-card db-chart"
+              aria-label={`${product} chart`}
+            >
+              <div className="db-toolbar">
+                <Seg
+                  label="Chart metric"
+                  value={metric}
+                  onChange={setMetric}
+                  options={[
+                    { value: 'price', label: 'Price' },
+                    { value: 'oi', label: 'Open interest' },
+                  ]}
+                />
+                <div className="db-toolbar-right">
+                  <Switch on={showVolume} onChange={setShowVolume}>
+                    Volume
+                  </Switch>
+                  {metric === 'price' && (
+                    <Switch on={compare} onChange={setCompare}>
+                      All products
+                    </Switch>
+                  )}
+                  <Seg
+                    label="Range"
+                    value={range}
+                    onChange={setRange}
+                    options={RANGES}
+                  />
+                </div>
+              </div>
+              {chartData ? (
+                <Suspense fallback={<Skeleton height={340} />}>
+                  <ProductChart
+                    product={product}
+                    series={chartData.series}
+                    metric={metric}
+                    range={range}
+                    showVolume={showVolume}
+                    compare={compare && metric === 'price'}
+                  />
+                </Suspense>
+              ) : (
+                <Skeleton height={340} />
+              )}
+              <div className="db-chart-legend" aria-hidden="true">
+                {(compare && metric === 'price' ? PRODUCTS : [product]).map(
+                  (name) => (
+                    <span key={name}>
+                      <i
+                        style={{
+                          background:
+                            compare && metric === 'price'
+                              ? productColor(name)
+                              : 'var(--text-strong)',
+                        }}
+                      />
+                      {name}
+                    </span>
+                  ),
+                )}
+                {showVolume && (
+                  <span>
+                    <i className="is-bar" />
+                    Volume
+                  </span>
+                )}
+                <span className="db-chart-note">
+                  {metric === 'price' ? '₹ per 10 g · ' : ''}nearest active
+                  contract{live ? ' · last point live' : ''}
+                </span>
+              </div>
+            </section>
+            <PairCheck
+              pairs={ranked}
+              selected={selectedPair}
+              onSelect={setPairChoice}
+              moves={moves}
+              live={live}
+              settledOn={dataAsOf}
+              span={span}
+              hasRanks={hasRanks}
+              onExplore={explore}
+            />
+          </div>
+
+          {/* Comparisons + selected pair's trend */}
+          <div className="db-bottom">
+            <section className="ui-card" aria-labelledby="pairs-title">
+              <div className="ui-card-head">
+                <h2 id="pairs-title">All comparisons</h2>
+                <p>{live ? 'Live · provisional' : 'Settlement prices'}</p>
+              </div>
+              {pairs.loading && !summaries.length ? (
+                <Skeleton height={260} />
+              ) : (
+                <div className="ui-table-scroll">
+                  <table className="ui-table ov-pairs">
+                    <thead>
+                      <tr>
+                        <th>Pair</th>
+                        <th className="num">Gap / 10 g</th>
+                        <th className="num">
+                          {live ? `Since ${shortDate(dataAsOf)}` : 'Day change'}
+                        </th>
+                        <th>vs usual</th>
+                        <th className="hide-sm">Last {WINDOW + 1}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ranked.map((row) => (
+                        <tr
+                          key={row.pair}
+                          className={`clickable ${row.pair === selectedPair?.pair ? 'is-selected' : ''}`}
+                          tabIndex={0}
+                          onClick={() => setPairChoice(row.pair)}
+                          onDoubleClick={() => explore(row)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') explore(row)
+                            if (event.key === ' ') {
+                              event.preventDefault()
+                              setPairChoice(row.pair)
+                            }
+                          }}
                         >
-                          {item.quality_reason
-                            ? humanize(item.quality_reason)
-                            : item.has_trade
-                              ? 'Traded observation'
-                              : 'No trade'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                          <td className="ov-pair-cell">
+                            {pairLabel(row.pair)}
+                            <span>Exp {shortDate(row.expiry)}</span>
+                          </td>
+                          <td className="num">{signedInr(row.spread_abs)}</td>
+                          <td className={`num tone-${toneOf(moves[row.pair])}`}>
+                            {signedInr(moves[row.pair])}
+                          </td>
+                          <td>
+                            {hasRanks ? (
+                              <GapChip z={row.z} />
+                            ) : (
+                              <span className="ui-muted-note">
+                                After {MIN_SESSIONS} sessions
+                              </span>
+                            )}
+                          </td>
+                          <td className="hide-sm">
+                            <Sparkline
+                              values={row.history
+                                .slice(-(WINDOW + 1))
+                                .map((point) => point.spread_abs)}
+                              width={110}
+                              color="var(--c6)"
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <p className="db-table-hint">
+                Click a row to check it above · double-click or Enter opens it
+                in Compare
+              </p>
+            </section>
+            <section className="ui-card db-card" aria-labelledby="gt-title">
+              <div className="db-card-head">
+                <div>
+                  <h2 id="gt-title">
+                    {selectedPair ? pairLabel(selectedPair.pair) : 'Gap trend'}
+                  </h2>
+                  <p>Gap per 10 g · last {trendSpan} sessions</p>
+                </div>
+                <Seg
+                  label="Sessions"
+                  value={trendSpan}
+                  onChange={setTrendSpan}
+                  options={['10', '30']}
+                />
+              </div>
+              <GapTrend
+                points={(selectedPair?.history ?? []).slice(-Number(trendSpan))}
+              />
+            </section>
+          </div>
+
+          {/* Plain-English summary */}
+          <section
+            className="ui-card ov-insights db-insights"
+            aria-labelledby="insights-title"
+          >
+            <div className="ui-card-head">
+              <h2 id="insights-title">What stands out</h2>
+              <p>{live ? 'From live prices' : `From ${shortDate(asOf)}`}</p>
             </div>
-          </>
-        ) : !overview.loading ? (
-          <p className="empty-state">
-            {overview.error
-              ? 'Expiry list unavailable because the Overview request failed. Retry References above.'
-              : 'No upcoming expiries in the returned data.'}
-          </p>
-        ) : null}
-      </section>
+            {insights.length ? (
+              <InsightList items={insights} />
+            ) : (
+              <p className="ui-muted-note">Nothing stands out yet.</p>
+            )}
+          </section>
+
+          {live && <p className="ov-live-note">{snapshot.note}</p>}
+        </div>
+      )}
     </div>
   )
 }
-import CrowLoader from '@/components/CrowLoader'
